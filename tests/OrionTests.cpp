@@ -1,0 +1,620 @@
+// Offline test runner for Orion Spark: pushes test signals through the real processor
+// and checks the things that can be verified without ears.
+//
+//   ./OrionTests            -> exit code 0 if everything passed
+
+#include "PluginProcessor.h"
+#include "Presets.h"
+#include "ui/Logo.h"
+#include <cmath>
+#include <functional>
+#include <iostream>
+
+namespace
+{
+
+int failures = 0;
+
+void check (bool condition, const juce::String& what)
+{
+    std::cout << (condition ? "  [pass] " : "  [FAIL] ") << what << "\n";
+    if (! condition)
+        ++failures;
+}
+
+void setParam (OrionAudioProcessor& p, const juce::String& id, float value)
+{
+    auto* param = p.getState().getParameter (id);
+    jassert (param != nullptr);
+    param->setValueNotifyingHost (param->convertTo0to1 (value));
+}
+
+void setAllPedals (OrionAudioProcessor& p, bool on)
+{
+    for (auto& pedal : p.getPedals())
+        setParam (p, pedal->getOnParamId(), on ? 1.0f : 0.0f);
+}
+
+struct RunResult
+{
+    std::vector<float> left, right;
+    bool finite = true;
+    float peak = 0.0f;
+
+    float rms (double sr, double fromSec, double toSec) const
+    {
+        const auto a = (size_t) (fromSec * sr), b = juce::jmin (left.size(), (size_t) (toSec * sr));
+        double sum = 0.0;
+        for (auto i = a; i < b; ++i)
+            sum += 0.5 * ((double) left[i] * left[i] + (double) right[i] * right[i]);
+        return b > a ? (float) std::sqrt (sum / (double) (b - a)) : 0.0f;
+    }
+};
+
+using Signal = std::function<float (int sampleIndex)>;
+using BlockHook = std::function<void (OrionAudioProcessor&, juce::Random&)>;
+
+// Mono signal in (as a host would deliver it), stereo out.
+RunResult run (OrionAudioProcessor& p, double sr, int blockSize, double seconds, const Signal& signal,
+               const BlockHook& perBlock = {}, bool garbageInSecondChannel = false, const Signal& rightSignal = {})
+{
+    if (rightSignal)
+    {
+        juce::AudioProcessor::BusesLayout stereo;
+        stereo.inputBuses.add (juce::AudioChannelSet::stereo());
+        stereo.outputBuses.add (juce::AudioChannelSet::stereo());
+        const bool ok = p.setBusesLayout (stereo);
+        jassert (ok);
+        juce::ignoreUnused (ok);
+    }
+
+    p.setPlayConfigDetails (rightSignal ? 2 : 1, 2, sr, blockSize);
+    p.prepareToPlay (sr, blockSize);
+
+    juce::AudioBuffer<float> buffer (2, blockSize);
+    juce::MidiBuffer midi;
+    juce::Random rng (1234);
+
+    RunResult r;
+    const int total = (int) (seconds * sr);
+    r.left.reserve ((size_t) total);
+    r.right.reserve ((size_t) total);
+
+    for (int start = 0; start < total; start += blockSize)
+    {
+        const int n = juce::jmin (blockSize, total - start);
+        buffer.setSize (2, n, false, false, true);
+
+        for (int i = 0; i < n; ++i)
+        {
+            buffer.setSample (0, i, signal (start + i));
+            buffer.setSample (1, i, rightSignal ? rightSignal (start + i)
+                                                : (garbageInSecondChannel ? rng.nextFloat() * 2.0f - 1.0f : 0.0f));
+        }
+
+        if (perBlock)
+            perBlock (p, rng);
+
+        p.processBlock (buffer, midi);
+
+        for (int i = 0; i < n; ++i)
+        {
+            const float l = buffer.getSample (0, i), rr = buffer.getSample (1, i);
+            if (! std::isfinite (l) || ! std::isfinite (rr))
+                r.finite = false;
+            r.peak = juce::jmax (r.peak, std::abs (l), std::abs (rr));
+            r.left.push_back (l);
+            r.right.push_back (rr);
+        }
+    }
+
+    return r;
+}
+
+float toDb (float x) { return juce::Decibels::gainToDecibels (x, -200.0f); }
+
+Signal impulse (float amp) { return [amp] (int i) { return i == 0 ? amp : 0.0f; }; }
+
+Signal noiseBurst (double sr, double seconds, float amp)
+{
+    auto rng = std::make_shared<juce::Random> (42);
+    const int len = (int) (seconds * sr);
+    return [=] (int i) { return i < len ? amp * (rng->nextFloat() * 2.0f - 1.0f) : 0.0f; };
+}
+
+Signal sweep (double sr, double seconds, float amp)
+{
+    return [=] (int i)
+    {
+        const double t = i / sr;
+        if (t >= seconds)
+            return 0.0f;
+        const double f0 = 20.0, f1 = 20000.0, k = std::log (f1 / f0) / seconds;
+        return amp * (float) std::sin (2.0 * juce::MathConstants<double>::pi * f0 * (std::exp (k * t) - 1.0) / k);
+    };
+}
+
+// -----------------------------------------------------------------------------
+void testDefaultsAcrossRatesAndBlocks()
+{
+    std::cout << "\nDefaults: impulse at several sample rates / block sizes\n";
+
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+        for (int bs : { 1, 37, 64, 512, 2048 })
+        {
+            OrionAudioProcessor p;
+            const auto r = run (p, sr, bs, 12.0, impulse (0.5f));
+            const float tail = r.rms (sr, 11.5, 12.0);
+            check (r.finite && r.peak < 2.0f && toDb (tail) < -90.0f,
+                   juce::String (sr, 0) + " Hz / block " + juce::String (bs)
+                       + ": finite, peak " + juce::String (toDb (r.peak), 1) + " dBFS, tail "
+                       + juce::String (toDb (tail), 1) + " dBFS");
+        }
+}
+
+void testSweep()
+{
+    std::cout << "\nDefaults: -6 dBFS sine sweep\n";
+    OrionAudioProcessor p;
+    const double sr = 48000.0;
+    const auto r = run (p, sr, 256, 14.0, sweep (sr, 4.0, 0.5f));
+    check (r.finite, "finite output");
+    check (r.peak < 4.0f, "peak bounded (" + juce::String (toDb (r.peak), 1) + " dBFS)");
+    check (toDb (r.rms (sr, 13.5, 14.0)) < -90.0f, "decays to silence");
+}
+
+void testSilenceInSilenceOut()
+{
+    std::cout << "\nSilence in -> silence out (defaults, hiss off)\n";
+    OrionAudioProcessor p;
+    const auto r = run (p, 48000.0, 512, 3.0, [] (int) { return 0.0f; });
+    check (r.finite && r.peak < 1.0e-7f, "output is silent (peak " + juce::String (r.peak) + ")");
+}
+
+void testWorstCaseSettings()
+{
+    std::cout << "\nWorst case: every knob at max, full-scale noise burst\n";
+    const double sr = 48000.0;
+
+    for (float echoTime : { 40.0f, 1200.0f })
+        for (float age : { 0.0f, 1.0f })
+          for (bool flanger : { false, true })
+        {
+            OrionAudioProcessor p;
+            setAllPedals (p, true);
+            setParam (p, "od_drive", 1.0f);
+            setParam (p, "od_tone", 1.0f);
+            setParam (p, "od_level", 18.0f);
+            for (auto id : { "amp_gain", "amp_bass", "amp_mid", "amp_treble", "amp_presence" })
+                setParam (p, id, 1.0f);
+            setParam (p, "amp_master", 12.0f);
+            setParam (p, "mod_rate", 8.0f);
+            setParam (p, "mod_depth", 1.0f);
+            setParam (p, "mod_regen", 1.0f);
+            setParam (p, "mod_mix", 1.0f);
+            setParam (p, "mod_flanger", flanger ? 1.0f : 0.0f);
+            setParam (p, "in_gain", 24.0f);
+            setParam (p, "out_gain", 12.0f);
+            setParam (p, "pre_drive", 1.0f);
+            setParam (p, "pre_level", 12.0f);
+            setParam (p, "pre_wobble", 1.0f);
+            setParam (p, "pre_hiss", 0.0f);
+            setParam (p, "echo_time", echoTime);
+            setParam (p, "echo_repeats", 1.0f);
+            setParam (p, "echo_mix", 1.0f);
+            setParam (p, "echo_age", age);
+            setParam (p, "echo_wobble", 1.0f);
+            setParam (p, "spring_decay", 1.0f);
+            setParam (p, "spring_mix", 1.0f);
+            setParam (p, "spring_drip", 1.0f);
+            setParam (p, "gate_threshold", -90.0f);
+
+            const auto r = run (p, sr, 512, 40.0, noiseBurst (sr, 2.0, 1.0f));
+            const float early = r.rms (sr, 3.0, 5.0);
+            const float late = r.rms (sr, 38.0, 40.0);
+            const auto name = "time " + juce::String (echoTime, 0) + " ms, age " + juce::String (age, 0)
+                              + (flanger ? ", flanger" : ", chorus");
+            check (r.finite, name + ": finite");
+            check (r.peak < 64.0f, name + ": bounded (peak " + juce::String (toDb (r.peak), 1) + " dBFS)");
+            check (late < early * 0.9f, name + ": feedback decays (" + juce::String (toDb (early), 1)
+                                            + " -> " + juce::String (toDb (late), 1) + " dB RMS)");
+        }
+}
+
+void testBypassIsTransparent()
+{
+    std::cout << "\nBypass: all pedals off == input delayed by reported latency\n";
+
+    for (double sr : { 44100.0, 96000.0 })
+    {
+        OrionAudioProcessor p;
+        setAllPedals (p, false);
+        auto in = noiseBurst (sr, 10.0, 0.5f);
+
+        std::vector<float> input;
+        const auto r = run (p, sr, 333, 1.0, [&] (int i) { const float x = in (i); input.push_back (x); return x; },
+                            {}, true);
+
+        const int latency = p.getLatencySamples();
+        float maxErr = 0.0f;
+        for (size_t i = (size_t) latency; i < r.left.size(); ++i)
+        {
+            const float expected = input[i - (size_t) latency];
+            maxErr = juce::jmax (maxErr, std::abs (r.left[i] - expected), std::abs (r.right[i] - expected));
+        }
+
+        check (maxErr < 1.0e-6f, juce::String (sr, 0) + " Hz: latency " + juce::String (latency)
+                                     + " samples, max error " + juce::String (maxErr));
+    }
+}
+
+void testAutomationStress()
+{
+    std::cout << "\nAutomation stress: random parameter changes every block\n";
+    const double sr = 48000.0;
+    OrionAudioProcessor p;
+
+    juce::StringArray ids;
+    for (auto* param : p.getParameters())
+        if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (param))
+            ids.add (withId->paramID);
+
+    const auto r = run (p, sr, 128, 20.0, noiseBurst (sr, 20.0, 0.25f),
+                        [&] (OrionAudioProcessor& proc, juce::Random& rng)
+                        {
+                            if (rng.nextInt (4) == 0)
+                                proc.getState().getParameter (ids[rng.nextInt (ids.size())])->setValueNotifyingHost (rng.nextFloat());
+                        });
+
+    check (r.finite, "finite output");
+    check (r.peak < 64.0f, "bounded (peak " + juce::String (toDb (r.peak), 1) + " dBFS)");
+}
+
+void testStateRoundTrip()
+{
+    std::cout << "\nState save / restore\n";
+    OrionAudioProcessor a;
+    setParam (a, "echo_time", 777.0f);
+    setParam (a, "pre_on", 0.0f);
+
+    juce::MemoryBlock data;
+    a.getStateInformation (data);
+
+    OrionAudioProcessor b;
+    b.setStateInformation (data.getData(), (int) data.getSize());
+    const float time = b.getState().getRawParameterValue ("echo_time")->load();
+    const float preOn = b.getState().getRawParameterValue ("pre_on")->load();
+    check (std::abs (time - 777.0f) < 0.5f && preOn < 0.5f, "parameters restored");
+}
+
+
+void testStereoInput()
+{
+    std::cout << "\nStereo input (as Ableton may negotiate)\n";
+    const double sr = 48000.0;
+
+    {
+        OrionAudioProcessor p;
+        setAllPedals (p, false);
+        auto l = noiseBurst (sr, 10.0, 0.5f);
+        auto r = sweep (sr, 10.0, 0.3f);
+        std::vector<float> inL, inR;
+        const auto res = run (p, sr, 256, 1.0,
+                              [&] (int i) { const float x = l (i); inL.push_back (x); return x; },
+                              {}, false,
+                              [&] (int i) { const float x = r (i); inR.push_back (x); return x; });
+        const int latency = p.getLatencySamples();
+        float maxErr = 0.0f;
+        for (size_t i = (size_t) latency; i < res.left.size(); ++i)
+            maxErr = juce::jmax (maxErr, std::abs (res.left[i] - inL[i - (size_t) latency]),
+                                 std::abs (res.right[i] - inR[i - (size_t) latency]));
+        check (p.getTotalNumInputChannels() == 2, "stereo layout accepted");
+        check (maxErr < 1.0e-6f, "bypass keeps L and R separate and aligned (max error " + juce::String (maxErr) + ")");
+    }
+    {
+        OrionAudioProcessor p;
+        const auto res = run (p, sr, 256, 12.0, sweep (sr, 4.0, 0.5f), {}, false, noiseBurst (sr, 4.0, 0.5f));
+        check (res.finite && res.peak < 4.0f, "defaults with stereo input: finite, peak " + juce::String (toDb (res.peak), 1) + " dBFS");
+        check (toDb (res.rms (sr, 11.5, 12.0)) < -90.0f, "defaults with stereo input: decays to silence");
+    }
+}
+
+void testWetPathLatency()
+{
+    std::cout << "\nReported latency matches the processed (wet) path\n";
+
+    struct Config { const char* name; std::function<void (OrionAudioProcessor&)> setup; float amplitude; };
+    const Config configs[] =
+    {
+        { "4-Track Pre", [] (OrionAudioProcessor& p)
+          {
+              setParam (p, "pre_on", 1.0f);
+              setParam (p, "pre_drive", 0.0f);
+              setParam (p, "pre_wobble", 0.0f);
+              setParam (p, "pre_tone", 1.0f);
+          }, 0.25f },
+        // Amp near-linear: low gain, quiet tone, flat tone stack, no presence, cab off.
+        { "Brit Stack", [] (OrionAudioProcessor& p)
+          {
+              setParam (p, "amp_on", 1.0f);
+              setParam (p, "amp_gain", 0.0f);
+              setParam (p, "amp_bass", 0.6f);
+              setParam (p, "amp_mid", 0.6f);
+              setParam (p, "amp_treble", 0.6f);
+              setParam (p, "amp_presence", 0.0f);
+              setParam (p, "amp_cab", 0.0f);
+          }, 0.01f },
+    };
+
+    for (const auto& config : configs)
+        for (double sr : { 44100.0, 48000.0, 96000.0 })
+        {
+            OrionAudioProcessor p;
+            setAllPedals (p, false);
+            config.setup (p);
+
+            // A 1 kHz tone burst: compare the phase of input and output via cross-correlation.
+            const int start = (int) (0.2 * sr), len = (int) (0.05 * sr);
+            const float amp = config.amplitude;
+            auto tone = [=] (int i)
+            {
+                if (i < start || i >= start + len) return 0.0f;
+                const double w = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi * (i - start) / len);
+                return (float) (amp * w * std::sin (2.0 * juce::MathConstants<double>::pi * 1000.0 * i / sr));
+            };
+            const auto res = run (p, sr, 512, 0.5, tone);
+
+            int bestLag = 0;
+            double best = -1.0e9;
+            for (int lag = 0; lag < (int) (0.02 * sr); ++lag)
+            {
+                double c = 0.0;
+                for (int i = start; i < start + len && (size_t) (i + lag) < res.left.size(); ++i)
+                    c += (double) tone (i) * res.left[(size_t) (i + lag)];
+                if (c > best) { best = c; bestLag = lag; }
+            }
+
+            const int latency = p.getLatencySamples();
+            check (std::abs (bestLag - latency) <= 2, juce::String (config.name) + ", " + juce::String (sr, 0) + " Hz: measured "
+                                                         + juce::String (bestLag) + " vs reported " + juce::String (latency) + " samples");
+        }
+}
+
+void reportLevels()
+{
+    std::cout << "\nLoudness at default settings (-18 dBFS 196 Hz sine, typical guitar DI level)\n";
+    const double sr = 48000.0;
+    auto sine = [=] (int i) { return 0.1259f * (float) std::sqrt (2.0) * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 196.0 * i / sr); };
+
+    for (const auto& only : juce::StringArray { "pre", "od", "amp", "all" })
+    {
+        OrionAudioProcessor p;
+        if (only != "all")
+        {
+            setAllPedals (p, false);
+            setParam (p, only + "_on", 1.0f);
+        }
+        const auto res = run (p, sr, 512, 2.0, sine);
+        const float outDb = toDb (res.rms (sr, 1.0, 2.0));
+        const auto label = only == "all" ? juce::String ("whole board (defaults)")
+                         : only == "pre" ? juce::String ("4-Track Pre only")
+                         : only == "od"  ? juce::String ("Overdrive only")
+                                         : juce::String ("Brit Stack only");
+        check (std::abs (outDb + 18.0f) < 4.0f, label
+                                                    + ": " + juce::String (outDb, 1) + " dBFS RMS out vs -18.0 in");
+    }
+
+    // The amp's auto-gain should keep loudness roughly steady across the Gain knob
+    // (wider tolerance: heavy clipping changes the waveform's crest factor).
+    for (float gain : { 0.0f, 1.0f })
+    {
+        OrionAudioProcessor p;
+        setAllPedals (p, false);
+        setParam (p, "amp_on", 1.0f);
+        setParam (p, "amp_gain", gain);
+        const auto res = run (p, sr, 512, 2.0, sine);
+        const float outDb = toDb (res.rms (sr, 1.0, 2.0));
+        check (std::abs (outDb + 18.0f) < 6.0f, "Brit Stack, gain " + juce::String (gain, 0) + ": "
+                                                    + juce::String (outDb, 1) + " dBFS RMS out vs -18.0 in");
+    }
+}
+
+void testPresets()
+{
+    std::cout << "\nFactory presets: load, play a -18 dBFS riff-like signal, check stability and loudness\n";
+    const double sr = 48000.0;
+    const auto& presets = orion::getFactoryPresets();
+
+    // Decaying plucked notes, roughly guitar-like, peaking around -12 dBFS.
+    auto riff = [=] (int i)
+    {
+        const double t = i / sr;
+        const double noteLen = 0.25;
+        const int note = (int) (t / noteLen);
+        const double tn = t - note * noteLen;
+        const double f = 82.4 * std::pow (2.0, ((note * 5) % 12) / 12.0);
+        return (float) (0.25 * std::exp (-tn * 6.0) * (std::sin (2.0 * juce::MathConstants<double>::pi * f * t)
+                                                        + 0.4 * std::sin (2.0 * juce::MathConstants<double>::pi * 2.0 * f * t)));
+    };
+
+    float inRms = 0.0f;
+    {
+        double sum = 0.0;
+        const int n = (int) (2.0 * sr);
+        for (int i = 0; i < n; ++i) sum += (double) riff (i) * riff (i);
+        inRms = (float) std::sqrt (sum / n);
+    }
+
+    for (int i = 0; i < (int) presets.size(); ++i)
+    {
+        OrionAudioProcessor p;
+        p.loadPreset (i);
+        const bool applied = p.getCurrentPreset() == i;
+        const auto r = run (p, sr, 256, 6.0, [&] (int n) { return n < (int) (4.0 * sr) ? riff (n) : 0.0f; });
+        const float outDb = toDb (r.rms (sr, 0.5, 4.0)) - toDb (inRms);
+        check (applied && r.finite && r.peak < 4.0f && std::abs (outDb) < 9.0f,
+               presets[(size_t) i].name.paddedRight (' ', 20) + ": peak " + juce::String (toDb (r.peak), 1)
+                   + " dBFS, loudness " + (outDb >= 0 ? "+" : "") + juce::String (outDb, 1) + " dB vs input");
+    }
+
+    // Spot-check that a preset really sets the board.
+    OrionAudioProcessor p;
+    p.loadPreset (2);
+    auto& st = p.getState();
+    check (st.getRawParameterValue ("amp_on")->load() > 0.5f && std::abs (st.getRawParameterValue ("echo_time")->load() - 420.0f) < 1.0f
+               && st.getRawParameterValue ("pre_on")->load() < 0.5f,
+           "\"" + presets[2].name + "\" sets amp on, echo 420 ms, 4-Track off");
+}
+
+void testPresetStateRoundTrip()
+{
+    std::cout << "\nPreset + tweaks survive save / restore (as in an Ableton set)\n";
+    OrionAudioProcessor a;
+    a.loadPreset (2);
+    setParam (a, "amp_gain", 0.33f);
+
+    juce::MemoryBlock data;
+    a.getStateInformation (data);
+
+    OrionAudioProcessor b;
+    b.setStateInformation (data.getData(), (int) data.getSize());
+    const float gain = b.getState().getRawParameterValue ("amp_gain")->load();
+    check (b.getCurrentPreset() == 2 && std::abs (gain - 0.33f) < 0.01f,
+           "preset index " + juce::String (b.getCurrentPreset()) + ", tweaked amp gain " + juce::String (gain, 2));
+}
+
+void testCpu()
+{
+    std::cout << "\nCPU: every pedal on, 48 kHz, 64-sample blocks\n";
+    const double sr = 48000.0;
+    const int block = 64;
+    OrionAudioProcessor p;
+    setAllPedals (p, true);
+    p.setPlayConfigDetails (1, 2, sr, block);
+    p.prepareToPlay (sr, block);
+
+    juce::AudioBuffer<float> buffer (2, block);
+    juce::MidiBuffer midi;
+    juce::Random rng (7);
+    const double seconds = 20.0;
+    const int blocks = (int) (seconds * sr / block);
+
+    const auto start = juce::Time::getMillisecondCounterHiRes();
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < block; ++i)
+            buffer.setSample (0, i, 0.2f * (rng.nextFloat() * 2.0f - 1.0f));
+        p.processBlock (buffer, midi);
+    }
+    const double elapsed = (juce::Time::getMillisecondCounterHiRes() - start) / 1000.0;
+    const double load = elapsed / seconds * 100.0;
+    check (load < 30.0, "uses " + juce::String (load, 1) + " % of one core in real time (" + juce::String (elapsed * 1.0e6 / blocks, 1)
+                            + " us per 1.33 ms block)");
+}
+
+} // namespace
+
+// Renders the editor to PNGs (default state, and with the echo bypassed) so the
+// layout can be checked without a host. Also reports which fonts resolved.
+static bool writeSnapshot (OrionAudioProcessor& p, const juce::File& file)
+{
+    std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+    const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
+    file.deleteFile();
+    juce::FileOutputStream out (file);
+    juce::PNGImageFormat png;
+    const bool ok = out.openedOk() && png.writeImageToStream (image, out);
+    std::cout << (ok ? "Wrote " : "Could not write ") << file.getFullPathName() << "\n";
+    return ok;
+}
+
+static int snapshot (const juce::File& file)
+{
+    for (auto [name, style] : { std::pair { "Avenir Next", "Demi Bold" }, std::pair { "Avenir Next Condensed", "Medium" },
+                                std::pair { "Snell Roundhand", "Bold" } })
+    {
+        juce::Font f (juce::FontOptions (name, style, 12.0f));
+        auto tf = f.getTypefacePtr();
+        std::cout << "Font '" << name << " / " << style << "' -> '"
+                  << (tf != nullptr ? tf->getName() + " / " + tf->getStyle() : juce::String ("none")) << "'\n";
+    }
+
+    OrionAudioProcessor p;
+    {
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
+        std::cout << "Editor open + first paint at 2x (Retina): "
+                  << juce::String (juce::Time::getMillisecondCounterHiRes() - t0, 0) << " ms\n";
+
+        const int w = editor->getWidth(), h = editor->getHeight();
+        for (float s : { 1.6f, 0.6f })
+        {
+            editor->setSize ((int) ((float) w * s), (int) ((float) h * s));
+            const auto stretched = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (500);
+            const auto t1 = juce::Time::getMillisecondCounterHiRes();
+            const auto crisp = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
+            std::cout << "Resized to " << s << "x (" << editor->getWidth() << " x " << editor->getHeight()
+                      << "), re-render after settling: " << juce::String (juce::Time::getMillisecondCounterHiRes() - t1, 0) << " ms\n";
+            const auto out = file.getSiblingFile (file.getFileNameWithoutExtension() + "-" + juce::String (s, 1) + "x.png");
+            out.deleteFile();
+            juce::FileOutputStream stream (out);
+            juce::PNGImageFormat().writeImageToStream (crisp, stream);
+            juce::ignoreUnused (stretched);
+        }
+    }
+
+    // Stand-alone logo on a transparent background.
+    {
+        juce::Image logo (juce::Image::ARGB, 1200, 1200, true);
+        juce::Graphics lg (logo);
+        orion::drawOrionSparkMark (lg, { 600.0f, 600.0f }, 240.0f);
+        const auto out = file.getSiblingFile ("logo.png");
+        out.getParentDirectory().createDirectory();
+        out.deleteFile();
+        juce::FileOutputStream stream (out);
+        const bool logoOk = stream.openedOk() && juce::PNGImageFormat().writeImageToStream (logo, stream);
+        std::cout << (logoOk ? "Wrote " : "Could not write ") << out.getFullPathName() << "\n";
+
+        // Preview on the plugin's dark background (image viewers often show alpha badly).
+        juce::Image preview (juce::Image::RGB, 1200, 1200, true);
+        juce::Graphics pg (preview);
+        pg.fillAll (juce::Colour (0xff0b0b0c));
+        pg.drawImageAt (logo, 0, 0);
+        const auto previewFile = file.getSiblingFile ("logo-on-dark.png");
+        previewFile.deleteFile();
+        juce::FileOutputStream ps (previewFile);
+        juce::PNGImageFormat().writeImageToStream (preview, ps);
+    }
+
+    bool ok = writeSnapshot (p, file);
+    setParam (p, "echo_on", 0.0f);
+    ok = writeSnapshot (p, file.getSiblingFile (file.getFileNameWithoutExtension() + "-echo-off.png")) && ok;
+    return ok ? 0 : 1;
+}
+
+int main (int argc, char* argv[])
+{
+    juce::ScopedJuceInitialiser_GUI juceInit;
+
+    if (argc == 3 && juce::String (argv[1]) == "--snapshot")
+        return snapshot (juce::File (argv[2]));
+
+    testSilenceInSilenceOut();
+    testBypassIsTransparent();
+    testStereoInput();
+    testWetPathLatency();
+    reportLevels();
+    testDefaultsAcrossRatesAndBlocks();
+    testSweep();
+    testWorstCaseSettings();
+    testAutomationStress();
+    testStateRoundTrip();
+    testPresets();
+    testPresetStateRoundTrip();
+    testCpu();
+
+    std::cout << "\n" << (failures == 0 ? "ALL TESTS PASSED" : juce::String (failures) + " TEST(S) FAILED") << "\n";
+    return failures == 0 ? 0 : 1;
+}
