@@ -193,6 +193,19 @@ OrionLookAndFeel::OrionLookAndFeel()
     setColour (juce::PopupMenu::headerTextColourId, colours::amber.withAlpha (0.8f));
     setColour (juce::PopupMenu::highlightedBackgroundColourId, Colour (0xff3b2a17));
     setColour (juce::PopupMenu::highlightedTextColourId, juce::Colours::white);
+
+    // Preset name / confirmation dialogs.
+    setColour (juce::AlertWindow::backgroundColourId, Colour (0xff121010));
+    setColour (juce::AlertWindow::textColourId, colours::cream);
+    setColour (juce::AlertWindow::outlineColourId, colours::amber.withAlpha (0.35f));
+    setColour (juce::TextEditor::backgroundColourId, Colour (0xff070605));
+    setColour (juce::TextEditor::textColourId, colours::amber);
+    setColour (juce::TextEditor::highlightColourId, colours::amber.withAlpha (0.3f));
+    setColour (juce::TextEditor::outlineColourId, colours::amber.withAlpha (0.25f));
+    setColour (juce::TextEditor::focusedOutlineColourId, colours::amber.withAlpha (0.6f));
+    setColour (juce::CaretComponent::caretColourId, colours::amber);
+    setColour (juce::TextButton::buttonColourId, Colour (0xff2a2420));
+    setColour (juce::TextButton::textColourOffId, colours::cream);
 }
 
 juce::Font OrionLookAndFeel::getSliderPopupFont (juce::Slider&) { return sans ("Demi Bold", 13.0f); }
@@ -801,20 +814,68 @@ PresetDisplay::PresetDisplay (OrionAudioProcessor& p) : processor (p)
     previous.onClick = [this] { step (-1); };
     next.onClick = [this] { step (1); };
     setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    refreshUserPresets();
+    shownChangeCount = processor.getPresetChangeCount();
     startTimerHz (10);
 }
 
 void PresetDisplay::timerCallback()
 {
-    if (processor.getCurrentPreset() != shownPreset)
+    if (const auto changeCount = processor.getPresetChangeCount(); changeCount != shownChangeCount)
+    {
+        shownChangeCount = changeCount;
+        refreshUserPresets();
         repaint();
+    }
+    else if (processor.isPresetModified() != shownModified)
+    {
+        repaint();
+    }
+}
+
+void PresetDisplay::refreshUserPresets()
+{
+    userPresets.clear();
+    for (const auto& preset : processor.getUserPresets().scan())
+        userPresets.push_back (preset.name);
+}
+
+int PresetDisplay::getCurrentIndex() const
+{
+    const auto current = processor.getCurrentPreset();
+    if (! current.isUser)
+        return findFactoryPreset (current.name);
+
+    for (size_t i = 0; i < userPresets.size(); ++i)
+        if (userPresets[i].equalsIgnoreCase (current.name))   // macOS file names ignore case
+            return (int) (getFactoryPresets().size() + i);
+
+    return -1;
+}
+
+void PresetDisplay::loadIndex (int index)
+{
+    const int numFactory = (int) getFactoryPresets().size();
+
+    if (index < numFactory)
+        processor.loadFactoryPreset (index);
+    else if (juce::isPositiveAndBelow (index - numFactory, (int) userPresets.size())
+             && ! processor.loadUserPreset (userPresets[(size_t) (index - numFactory)]))
+        refreshUserPresets();   // deleted or renamed outside Orion Spark
+
+    repaint();
 }
 
 void PresetDisplay::step (int delta)
 {
-    const int count = processor.getNumPresets();
-    processor.loadPreset ((processor.getCurrentPreset() + delta + count) % count);
-    repaint();
+    refreshUserPresets();
+    const int count = (int) (getFactoryPresets().size() + userPresets.size());
+    const int current = getCurrentIndex();
+
+    if (current < 0)
+        loadIndex (delta > 0 ? 0 : count - 1);
+    else
+        loadIndex ((current + delta + count) % count);
 }
 
 juce::Rectangle<float> PresetDisplay::getWindowArea() const
@@ -830,39 +891,221 @@ void PresetDisplay::resized()
 
 void PresetDisplay::mouseUp (const juce::MouseEvent& e)
 {
-    if (! getWindowArea().contains (e.position))
-        return;
+    if (getWindowArea().contains (e.position))
+        showMenu();
+}
 
-    const auto& presets = getFactoryPresets();
+void PresetDisplay::showMenu()
+{
+    enum MenuIds { save = 1, saveAsId, renameId, deleteId, showFolder, firstPreset = 1000 };
+
+    refreshUserPresets();
+    const auto current = processor.getCurrentPreset();
+    const int currentIndex = getCurrentIndex();
+    const auto& factory = getFactoryPresets();
+    const int numFactory = (int) factory.size();
+
     juce::PopupMenu menu;
     juce::String category;
-    for (size_t i = 0; i < presets.size(); ++i)
+    for (int i = 0; i < numFactory; ++i)
     {
-        if (presets[i].category != category)
+        if (factory[(size_t) i].category != category)
         {
-            category = presets[i].category;
+            category = factory[(size_t) i].category;
             menu.addSectionHeader (category.toUpperCase());
         }
-        menu.addItem ((int) i + 1, presets[i].name, true, (int) i == processor.getCurrentPreset());
+        menu.addItem (firstPreset + i, factory[(size_t) i].name, true, i == currentIndex);
     }
+
+    menu.addSectionHeader (juce::String (UserPresetLibrary::category).toUpperCase());
+    for (int i = 0; i < (int) userPresets.size(); ++i)
+        menu.addItem (firstPreset + numFactory + i, userPresets[(size_t) i], true, numFactory + i == currentIndex);
+    if (userPresets.empty())
+        menu.addItem (-1, "No saved presets yet", false);
+
+    // Factory presets are read-only; their tweaks go to a new preset with Save As.
+    const bool userPresetExists = current.isUser && currentIndex >= 0;
+    menu.addSeparator();
+    menu.addItem (save, current.isUser ? "Save \"" + current.name + "\"" : juce::String ("Save"), current.isUser);
+    menu.addItem (saveAsId, "Save As...");
+    menu.addItem (renameId, "Rename...", userPresetExists);
+    menu.addItem (deleteId, "Delete", userPresetExists);
+    menu.addSeparator();
+    menu.addItem (showFolder, "Show Presets Folder");
 
     juce::Component::SafePointer<PresetDisplay> safe (this);
     menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this).withMinimumWidth (getWidth() - 72),
-                        [safe] (int result)
+                        [safe, current] (int result)
                         {
-                            if (safe != nullptr && result > 0)
+                            if (safe == nullptr || result <= 0)
+                                return;
+
+                            switch (result)
                             {
-                                safe->processor.loadPreset (result - 1);
-                                safe->repaint();
+                                case save:     safe->saveCurrent(); break;
+                                case renameId: safe->askForName ("Rename Preset", current.name, "Rename",
+                                                                 [safe] (const juce::String& name) { if (safe != nullptr) safe->renameCurrent (name); });
+                                               break;
+                                case saveAsId: safe->askForName ("Save Preset", current.name, "Save",
+                                                                 [safe] (const juce::String& name) { if (safe != nullptr) safe->saveAs (name); });
+                                               break;
+                                case deleteId: safe->deleteCurrent(); break;
+                                case showFolder:
+                                {
+                                    const auto folder = safe->processor.getUserPresets().getFolder();
+                                    folder.createDirectory();
+                                    folder.startAsProcess();   // opens it in Finder
+                                    break;
+                                }
+                                default:       safe->loadIndex (result - firstPreset); break;
                             }
                         });
 }
 
+void PresetDisplay::saveCurrent()
+{
+    const auto current = processor.getCurrentPreset();
+    if (current.isUser && ! processor.saveUserPreset (current.name))
+        showMessage ("Couldn't Save Preset", "\"" + current.name + "\" could not be written to\n"
+                                                 + processor.getUserPresets().getFolder().getFullPathName());
+    repaint();
+}
+
+void PresetDisplay::saveAs (const juce::String& name)
+{
+    const auto cleaned = UserPresetLibrary::cleanName (name);
+    if (cleaned.isEmpty())
+    {
+        showMessage ("Save Preset", "Please enter a name.");
+        return;
+    }
+
+    juce::Component::SafePointer<PresetDisplay> safe (this);
+    auto write = [safe, cleaned]
+    {
+        if (safe == nullptr)
+            return;
+        if (! safe->processor.saveUserPreset (cleaned))
+            safe->showMessage ("Couldn't Save Preset", "\"" + cleaned + "\" could not be written to\n"
+                                                           + safe->processor.getUserPresets().getFolder().getFullPathName());
+        safe->repaint();
+    };
+
+    if (processor.getUserPresets().exists (cleaned))
+        confirm ("Replace Preset?", "A preset named \"" + cleaned + "\" already exists. Replace it?", "Replace", write);
+    else
+        write();
+}
+
+void PresetDisplay::renameCurrent (const juce::String& newName)
+{
+    const auto current = processor.getCurrentPreset();
+    const auto cleaned = UserPresetLibrary::cleanName (newName);
+
+    if (cleaned.isEmpty())
+        showMessage ("Rename Preset", "Please enter a name.");
+    else if (cleaned == current.name)
+        return;
+    else if (processor.getUserPresets().exists (cleaned) && ! cleaned.equalsIgnoreCase (current.name))
+        showMessage ("Rename Preset", "A preset named \"" + cleaned + "\" already exists.");
+    else if (! processor.renameUserPreset (current.name, cleaned))
+        showMessage ("Couldn't Rename Preset", "\"" + current.name + "\" could not be renamed.");
+
+    repaint();
+}
+
+void PresetDisplay::deleteCurrent()
+{
+    const auto name = processor.getCurrentPreset().name;
+    juce::Component::SafePointer<PresetDisplay> safe (this);
+
+    confirm ("Delete Preset?", "\"" + name + "\" will be moved to the Trash.", "Delete",
+             [safe, name]
+             {
+                 if (safe == nullptr)
+                     return;
+                 if (! safe->processor.deleteUserPreset (name))
+                     safe->showMessage ("Couldn't Delete Preset", "\"" + name + "\" could not be moved to the Trash.");
+                 safe->repaint();
+             });
+}
+
+juce::Component& PresetDisplay::getDialogParent()
+{
+    // The root is scaled with the window, so dialogs scale with it.
+    auto* parent = getParentComponent();
+    return parent != nullptr ? *parent : *this;
+}
+
+void PresetDisplay::askForName (const juce::String& title, const juce::String& initialName, const juce::String& confirmText,
+                                std::function<void (const juce::String&)> onConfirm)
+{
+    // Its own small window rather than a child of the editor: the VST3 wrapper makes the
+    // plugin window ignore key presses (EDITOR_WANTS_KEYBOARD_FOCUS is off), which would
+    // stop the name from being typed.
+    nameDialog = std::make_unique<juce::AlertWindow> (title, juce::String(), juce::MessageBoxIconType::NoIcon, this);
+    nameDialog->setLookAndFeel (&getLookAndFeel());
+    nameDialog->setAlwaysOnTop (true);
+    nameDialog->addTextEditor ("name", initialName, "Name:");
+    nameDialog->addButton (confirmText, 1, juce::KeyPress (juce::KeyPress::returnKey));
+    nameDialog->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    if (auto* editor = nameDialog->getTextEditor ("name"))
+    {
+        editor->setInputRestrictions (UserPresetLibrary::maxNameLength);
+        editor->selectAll();
+    }
+
+    juce::Component::SafePointer<PresetDisplay> safe (this);
+    nameDialog->enterModalState (true, juce::ModalCallbackFunction::create ([safe, callback = std::move (onConfirm)] (int result)
+    {
+        if (safe == nullptr || safe->nameDialog == nullptr)
+            return;
+
+        const auto name = safe->nameDialog->getTextEditorContents ("name");
+        safe->nameDialog.reset();
+
+        if (result == 1)
+            callback (name);
+    }), false);
+}
+
+void PresetDisplay::confirm (const juce::String& title, const juce::String& message, const juce::String& confirmText,
+                             std::function<void()> onConfirm)
+{
+    messageBox = juce::AlertWindow::showScopedAsync (juce::MessageBoxOptions()
+                                                         .withIconType (juce::MessageBoxIconType::QuestionIcon)
+                                                         .withTitle (title)
+                                                         .withMessage (message)
+                                                         .withButton (confirmText, 1)
+                                                         .withButton ("Cancel", 0)
+                                                         .withParentComponent (&getDialogParent()),
+                                                     [callback = std::move (onConfirm)] (int result)
+                                                     {
+                                                         if (result == 1)
+                                                             callback();
+                                                     });
+}
+
+void PresetDisplay::showMessage (const juce::String& title, const juce::String& message)
+{
+    messageBox = juce::AlertWindow::showScopedAsync (juce::MessageBoxOptions()
+                                                         .withIconType (juce::MessageBoxIconType::WarningIcon)
+                                                         .withTitle (title)
+                                                         .withMessage (message)
+                                                         .withButton ("OK", 0)
+                                                         .withParentComponent (&getDialogParent()),
+                                                     nullptr);
+}
+
 void PresetDisplay::paint (juce::Graphics& g)
 {
-    const auto& presets = getFactoryPresets();
-    shownPreset = processor.getCurrentPreset();
-    const auto& preset = presets[(size_t) juce::jlimit (0, (int) presets.size() - 1, shownPreset)];
+    const auto current = processor.getCurrentPreset();
+    const int index = getCurrentIndex();
+    const int factoryIndex = current.isUser ? -1 : findFactoryPreset (current.name);
+    const auto category = current.isUser ? juce::String (UserPresetLibrary::category)
+                                         : (factoryIndex >= 0 ? getFactoryPresets()[(size_t) factoryIndex].category : juce::String());
+    shownModified = processor.isPresetModified();
     const auto w = getWindowArea();
 
     // Recessed bezel.
@@ -894,11 +1137,12 @@ void PresetDisplay::paint (juce::Graphics& g)
     };
 
     g.setFont (sans ("Demi Bold", 10.0f, 0.1f));
-    glowText (juce::String (shownPreset + 1).paddedLeft ('0', 2), indexArea, juce::Justification::centredLeft, colours::amber.withAlpha (0.55f));
+    glowText (index >= 0 ? juce::String (index + 1).paddedLeft ('0', 2) : juce::String ("--"), indexArea,
+              juce::Justification::centredLeft, colours::amber.withAlpha (0.55f));
     g.setFont (sans ("Demi Bold", 17.0f, 0.04f));
-    glowText (preset.name, text, juce::Justification::centredLeft, colours::amber);
+    glowText (current.name + (shownModified ? " *" : ""), text, juce::Justification::centredLeft, colours::amber);
     g.setFont (sans ("Demi Bold", 8.0f, 0.22f));
-    glowText (preset.category.toUpperCase() + juce::String (juce::CharPointer_UTF8 ("  \xe2\x96\xbe")), categoryArea,
+    glowText (category.toUpperCase() + juce::String (juce::CharPointer_UTF8 ("  \xe2\x96\xbe")), categoryArea,
               juce::Justification::centredRight, colours::amber.withAlpha (0.6f));
 
     // Glass reflection.

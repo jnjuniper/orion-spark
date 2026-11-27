@@ -450,8 +450,8 @@ void testPresets()
     for (int i = 0; i < (int) presets.size(); ++i)
     {
         OrionAudioProcessor p;
-        p.loadPreset (i);
-        const bool applied = p.getCurrentPreset() == i;
+        p.loadFactoryPreset (i);
+        const bool applied = ! p.getCurrentPreset().isUser && p.getCurrentPreset().name == presets[(size_t) i].name;
         const auto r = run (p, sr, 256, 6.0, [&] (int n) { return n < (int) (4.0 * sr) ? riff (n) : 0.0f; });
         const float outDb = toDb (r.rms (sr, 0.5, 4.0)) - toDb (inRms);
         check (applied && r.finite && r.peak < 4.0f && std::abs (outDb) < 9.0f,
@@ -461,7 +461,7 @@ void testPresets()
 
     // Spot-check that a preset really sets the board.
     OrionAudioProcessor p;
-    p.loadPreset (2);
+    p.loadFactoryPreset (2);
     auto& st = p.getState();
     check (st.getRawParameterValue ("amp_on")->load() > 0.5f && std::abs (st.getRawParameterValue ("echo_time")->load() - 420.0f) < 1.0f
                && st.getRawParameterValue ("pre_on")->load() < 0.5f,
@@ -471,8 +471,9 @@ void testPresets()
 void testPresetStateRoundTrip()
 {
     std::cout << "\nPreset + tweaks survive save / restore (as in an Ableton set)\n";
+    const auto& presets = orion::getFactoryPresets();
     OrionAudioProcessor a;
-    a.loadPreset (2);
+    a.loadFactoryPreset (2);
     setParam (a, "amp_gain", 0.33f);
 
     juce::MemoryBlock data;
@@ -481,8 +482,140 @@ void testPresetStateRoundTrip()
     OrionAudioProcessor b;
     b.setStateInformation (data.getData(), (int) data.getSize());
     const float gain = b.getState().getRawParameterValue ("amp_gain")->load();
-    check (b.getCurrentPreset() == 2 && std::abs (gain - 0.33f) < 0.01f,
-           "preset index " + juce::String (b.getCurrentPreset()) + ", tweaked amp gain " + juce::String (gain, 2));
+    check (b.getCurrentPreset().name == presets[2].name && ! b.getCurrentPreset().isUser && std::abs (gain - 0.33f) < 0.01f,
+           "preset \"" + b.getCurrentPreset().name + "\", tweaked amp gain " + juce::String (gain, 2));
+    check (b.isPresetModified(), "restored tweaks still show as modified");
+
+    // Sessions saved before user presets stored the factory preset as a list index.
+    OrionAudioProcessor legacy;
+    {
+        auto tree = a.getState().copyState();
+        tree.removeProperty ("presetName", nullptr);
+        tree.removeProperty ("presetIsUser", nullptr);
+        tree.setProperty ("preset", 3, nullptr);
+        juce::MemoryBlock old;
+        juce::AudioProcessor::copyXmlToBinary (*tree.createXml(), old);
+        legacy.setStateInformation (old.getData(), (int) old.getSize());
+    }
+    check (legacy.getCurrentPreset().name == presets[3].name && ! legacy.getCurrentPreset().isUser,
+           "old session with preset index 3 shows \"" + legacy.getCurrentPreset().name + "\"");
+}
+
+// A fresh, empty preset folder that is removed again afterwards.
+struct TempPresetFolder
+{
+    TempPresetFolder()  { folder.deleteRecursively(); folder.createDirectory(); }
+    ~TempPresetFolder() { folder.deleteRecursively(); }
+
+    juce::File folder = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                            .getChildFile ("OrionTests-presets-" + juce::String::toHexString (juce::Random::getSystemRandom().nextInt64()));
+
+    orion::UserPresetLibrary library() const { return orion::UserPresetLibrary (folder, false); }   // no Trash in tests
+};
+
+void testUserPresets()
+{
+    std::cout << "\nUser presets: save, load, overwrite, rename, delete\n";
+    TempPresetFolder temp;
+
+    OrionAudioProcessor a (temp.library());
+    a.loadFactoryPreset (2);
+    check (! a.isPresetModified(), "freshly loaded factory preset is not modified");
+    setParam (a, "amp_gain", 0.31f);
+    setParam (a, "echo_time", 555.0f);
+    setParam (a, "in_gain", 6.0f);
+    check (a.isPresetModified(), "tweaking a knob marks it modified");
+
+    check (a.saveUserPreset ("  My Crunch  ") && a.getUserPresets().exists ("My Crunch"), "Save As writes \"My Crunch\"");
+    check (a.getCurrentPreset().isUser && a.getCurrentPreset().name == "My Crunch" && ! a.isPresetModified(),
+           "saved preset becomes current and unmodified");
+
+    // Load it into a fresh instance: same values, global input gain untouched.
+    OrionAudioProcessor b (temp.library());
+    const bool loaded = b.loadUserPreset ("My Crunch");
+    auto& st = b.getState();
+    check (loaded && std::abs (st.getRawParameterValue ("amp_gain")->load() - 0.31f) < 0.001f
+               && std::abs (st.getRawParameterValue ("echo_time")->load() - 555.0f) < 0.5f
+               && st.getRawParameterValue ("amp_on")->load() > 0.5f,
+           "loads with the same values");
+    check (std::abs (st.getRawParameterValue ("in_gain")->load()) < 0.01f, "input gain is not part of a preset");
+    check (! b.isPresetModified(), "loaded user preset is not modified");
+
+    // Overwrite.
+    setParam (b, "amp_gain", 0.5f);
+    check (b.isPresetModified(), "tweak marks it modified");
+    check (b.saveUserPreset ("My Crunch") && ! b.isPresetModified(), "Save overwrites the user preset");
+    a.loadUserPreset ("My Crunch");
+    check (std::abs (a.getState().getRawParameterValue ("amp_gain")->load() - 0.5f) < 0.001f, "other instance sees the new values");
+
+    // Session restore points at the user preset.
+    juce::MemoryBlock data;
+    b.getStateInformation (data);
+    OrionAudioProcessor c (temp.library());
+    c.setStateInformation (data.getData(), (int) data.getSize());
+    check (c.getCurrentPreset().isUser && c.getCurrentPreset().name == "My Crunch" && ! c.isPresetModified(),
+           "session restore shows \"My Crunch\", not modified");
+
+    // Rename.
+    check (b.renameUserPreset ("My Crunch", "Big Crunch") && b.getCurrentPreset().name == "Big Crunch"
+               && ! b.getUserPresets().exists ("My Crunch") && b.getUserPresets().exists ("Big Crunch"),
+           "rename moves the file and updates the current preset");
+    check (b.saveUserPreset ("Other") && ! b.renameUserPreset ("Other", "Big Crunch"), "rename refuses to replace another preset");
+
+    // Library listing.
+    const auto list = b.getUserPresets().scan();
+    check (list.size() == 2 && list[0].name == "Big Crunch" && list[1].name == "Other", "folder lists 2 presets, sorted");
+
+    // Junk in the folder is ignored.
+    temp.folder.getChildFile ("Broken.orionpreset").replaceWithText ("this is not xml");
+    temp.folder.getChildFile ("Weird.orionpreset").replaceWithText (
+        "<OrionPreset version=\"1\"><Param id=\"no_such_param\" value=\"1\"/><Param id=\"amp_gain\" value=\"nan\"/>"
+        "<Param id=\"echo_time\" value=\"999999\"/></OrionPreset>");
+    check (b.getUserPresets().scan().size() == 3, "unreadable file is skipped");
+    OrionAudioProcessor d (temp.library());
+    const bool weirdLoaded = d.loadUserPreset ("Weird");
+    const float time = d.getState().getRawParameterValue ("echo_time")->load();
+    const float maxTime = d.getState().getParameterRange ("echo_time").end;
+    const float ampGain = d.getState().getRawParameterValue ("amp_gain")->load();
+    check (weirdLoaded && std::isfinite (time) && time <= maxTime && std::isfinite (ampGain),
+           "unknown IDs, NaN and out-of-range values are handled (echo " + juce::String (time, 0) + " ms)");
+
+    // A file added in Finder whose name can't be a preset name isn't listed.
+    temp.folder.getChildFile ("My, Crunch.orionpreset").replaceWithText ("<OrionPreset version=\"1\"/>");
+    check (b.getUserPresets().scan().size() == 3, "file named \"My, Crunch\" is not listed");
+
+    // Names.
+    const juce::String nordic (juce::CharPointer_UTF8 ("\xc3\x85skv\xc3\xa4" "der \xc3\xb6st"));   // Åskväder öst
+    const bool nordicSaved = b.saveUserPreset (nordic);
+    bool nordicListed = false;
+    for (const auto& preset : b.getUserPresets().scan())
+        nordicListed = nordicListed || preset.name == nordic;
+    check (nordicSaved && nordicListed && b.loadUserPreset (nordic) && b.getCurrentPreset().name == nordic, "non-ASCII name saves, lists and loads");
+
+    using Lib = orion::UserPresetLibrary;
+    check (Lib::cleanName ("a/b:c") == "abc" && Lib::cleanName ("..") .isEmpty() && Lib::cleanName ("   ").isEmpty()
+               && Lib::cleanName ("Sykes '87") == "Sykes '87" && Lib::cleanName (juce::String::repeatedString ("x", 100)).length() == Lib::maxNameLength,
+           "names are cleaned for use as file names");
+    check (! b.saveUserPreset ("///"), "unusable name is refused");
+
+    // Delete: the board keeps its sound and name but shows as unsaved.
+    b.loadUserPreset ("Big Crunch");
+    const bool deleted = b.deleteUserPreset ("Big Crunch");
+    check (deleted && ! b.getUserPresets().exists ("Big Crunch") && b.getCurrentPreset().name == "Big Crunch" && b.isPresetModified(),
+           "delete removes the file; the board keeps the name and shows modified");
+    check (! c.loadUserPreset ("Big Crunch"), "loading a deleted preset fails cleanly");
+
+    // A session whose user preset has since been deleted keeps its name and sound.
+    b.saveUserPreset ("Gone Soon");
+    juce::MemoryBlock gone;
+    b.getStateInformation (gone);
+    b.deleteUserPreset ("Gone Soon");
+    OrionAudioProcessor e (temp.library());
+    e.setStateInformation (gone.getData(), (int) gone.getSize());
+    check (e.getCurrentPreset().isUser && e.getCurrentPreset().name == "Gone Soon"
+               && std::abs (e.getState().getRawParameterValue ("amp_gain")->load() - b.getState().getRawParameterValue ("amp_gain")->load()) < 0.001f
+               && e.isPresetModified(),
+           "session with a deleted user preset restores its name and values, shown as modified");
 }
 
 void testCpu()
@@ -885,6 +1018,7 @@ int main (int argc, char* argv[])
     testStateRoundTrip();
     testPresets();
     testPresetStateRoundTrip();
+    testUserPresets();
     testCpu();
     testTunerNotes();
     testTunerAccuracy();

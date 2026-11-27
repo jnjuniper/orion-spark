@@ -63,7 +63,14 @@ the plugin window closes, so the plugin can't be left silent by accident.
 
 **Presets:** click the display in the header (or use the arrows). Factory presets are tones "inspired by"
 John Sykes, Mk.gee, 70s rock and metal rhythm players. The selected preset and any tweaks are saved with
-your Ableton set.
+your Ableton set. A `*` after the name means the knobs differ from the saved preset.
+
+**User presets:** _Save As..._ in the preset menu stores the board under a name of your own; _Save_ overwrites
+the current user preset (factory presets are read-only, so tweaks to one go to a new preset). _Rename_ and
+_Delete_ (moves the file to the Trash) work on the current user preset. Presets are files in
+`~/Library/Application Support/Orion Spark/Presets/` (_Show Presets Folder_ in the menu), shared by the AU,
+VST3 and standalone app, so they can be backed up or copied to another Mac. The input/output knobs are not
+part of a preset.
 
 The whole UI is drawn procedurally (`src/ui/Render.cpp`, `src/ui/Logo.cpp`), with no image assets: lit
 enclosures, spun-metal knobs, chrome, cables, the walnut floor and the logo are all generated in code.
@@ -106,7 +113,8 @@ auval -v aufx Orsk Nrth
 
 `OrionTests` runs the real processor offline: silence, impulses and sweeps at 44.1/48/96 kHz with block
 sizes 1–2048, every knob at max with full-scale noise (checks feedback can't run away), bypass transparency,
-latency, loudness, every factory preset, random automation, state save/restore and CPU load.
+latency, loudness, every factory preset, user preset files (in a temporary folder), random automation, state
+save/restore and CPU load.
 `OrionTests --snapshot docs/screenshot.png` re-renders the screenshot and `docs/logo.png`.
 
 ## Adding a pedal

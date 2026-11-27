@@ -1,6 +1,5 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
-#include "Presets.h"
 #include "pedals/NoiseGate.h"
 #include "pedals/Overdrive.h"
 #include "pedals/BritStack.h"
@@ -9,18 +8,21 @@
 #include "pedals/TapeEcho.h"
 #include "pedals/SpringReverb.h"
 
-OrionAudioProcessor::OrionAudioProcessor()
+OrionAudioProcessor::OrionAudioProcessor (orion::UserPresetLibrary userPresetLibrary)
     : AudioProcessor (BusesProperties()
                           .withInput ("Input", juce::AudioChannelSet::mono(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       pedals (createPedals()),
-      state (*this, nullptr, "OrionState", createLayout())
+      state (*this, nullptr, "OrionState", createLayout()),
+      userPresets (std::move (userPresetLibrary))
 {
     for (auto& pedal : pedals)
         pedal->attach (state);
 
     inputGainParam = state.getRawParameterValue (inputGainId);
     outputGainParam = state.getRawParameterValue (outputGainId);
+
+    setCurrentPreset ({ false, orion::getFactoryPresets().front().name });   // all defaults = "Init"
 }
 
 std::vector<std::unique_ptr<orion::Pedal>> OrionAudioProcessor::createPedals()
@@ -139,21 +141,141 @@ void OrionAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     }
 }
 
-int OrionAudioProcessor::getNumPresets() const
+// ---------------------------------------------------------------------------
+// Presets
+//
+// The current preset is saved in the state as a name plus whether it's a user
+// preset, never as a list position: user presets come and go, which would shift
+// positions. Sessions from before user presets stored a factory index ("preset").
+
+namespace
 {
-    return (int) orion::getFactoryPresets().size();
+    constexpr const char* presetNameProperty = "presetName";
+    constexpr const char* presetIsUserProperty = "presetIsUser";
+    constexpr const char* legacyPresetIndexProperty = "preset";
 }
 
-void OrionAudioProcessor::loadPreset (int index)
+OrionAudioProcessor::PresetRef OrionAudioProcessor::getCurrentPreset() const
+{
+    const juce::SpinLock::ScopedLockType lock (presetLock);
+    return currentPreset;
+}
+
+void OrionAudioProcessor::setCurrentPreset (PresetRef ref)
+{
+    {
+        const juce::SpinLock::ScopedLockType lock (presetLock);
+        std::swap (currentPreset, ref);
+    }
+
+    ++presetChangeCount;
+}
+
+void OrionAudioProcessor::loadFactoryPreset (int index)
 {
     JUCE_ASSERT_MESSAGE_THREAD
     const auto& presets = orion::getFactoryPresets();
     if (! juce::isPositiveAndBelow (index, (int) presets.size()))
         return;
 
-    orion::applyPreset (state, presets[(size_t) index]);
-    currentPreset = index;
-    state.state.setProperty ("preset", index, nullptr);
+    const auto& preset = presets[(size_t) index];
+    orion::applyPreset (*this, preset);
+    presetBaseline = orion::resolvePreset (*this, preset);
+    presetBaselineKnown = true;
+    presetBaselineStale = false;
+    setCurrentPreset ({ false, preset.name });
+}
+
+bool OrionAudioProcessor::loadUserPreset (const juce::String& name)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    const auto preset = userPresets.load (name);
+    if (! preset)
+        return false;
+
+    orion::applyPreset (*this, *preset);
+    presetBaseline = orion::resolvePreset (*this, *preset);
+    presetBaselineKnown = true;
+    presetBaselineStale = false;
+    setCurrentPreset ({ true, preset->name });
+    return true;
+}
+
+bool OrionAudioProcessor::saveUserPreset (const juce::String& name)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    const auto cleaned = orion::UserPresetLibrary::cleanName (name);
+    if (cleaned.isEmpty())
+        return false;
+
+    const auto preset = orion::capturePreset (*this, cleaned);
+    if (! userPresets.save (preset))
+        return false;
+
+    presetBaseline = orion::resolvePreset (*this, preset);
+    presetBaselineKnown = true;
+    presetBaselineStale = false;
+    setCurrentPreset ({ true, cleaned });
+    return true;
+}
+
+bool OrionAudioProcessor::renameUserPreset (const juce::String& from, const juce::String& to)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    const auto cleaned = orion::UserPresetLibrary::cleanName (to);
+    if (! userPresets.rename (from, cleaned))
+        return false;
+
+    const auto current = getCurrentPreset();
+    if (current.isUser && current.name.equalsIgnoreCase (from))
+        setCurrentPreset ({ true, cleaned });
+    else
+        ++presetChangeCount;   // the library changed
+
+    return true;
+}
+
+bool OrionAudioProcessor::deleteUserPreset (const juce::String& name)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    if (! userPresets.remove (name))
+        return false;
+
+    // The board keeps its sound and name; it now shows as unsaved.
+    presetBaselineStale = true;
+    ++presetChangeCount;
+    return true;
+}
+
+void OrionAudioProcessor::rebuildPresetBaseline()
+{
+    const auto ref = getCurrentPreset();
+    std::optional<orion::Preset> preset;
+
+    if (ref.isUser)
+        preset = userPresets.load (ref.name);
+    else if (const int index = orion::findFactoryPreset (ref.name); index >= 0)
+        preset = orion::getFactoryPresets()[(size_t) index];
+
+    presetBaselineKnown = preset.has_value();
+    presetBaseline = preset ? orion::resolvePreset (*this, *preset)
+                            : std::vector<std::pair<juce::RangedAudioParameter*, float>>();
+}
+
+bool OrionAudioProcessor::isPresetModified()
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    if (presetBaselineStale.exchange (false))
+        rebuildPresetBaseline();
+
+    if (! presetBaselineKnown)
+        return true;
+
+    for (const auto& [param, value] : presetBaseline)
+        if (std::abs (param->getValue() - value) > 1.0e-4f)
+            return true;
+
+    return false;
 }
 
 juce::AudioProcessorEditor* OrionAudioProcessor::createEditor()
@@ -163,7 +285,13 @@ juce::AudioProcessorEditor* OrionAudioProcessor::createEditor()
 
 void OrionAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    if (auto xml = state.copyState().createXml())
+    auto tree = state.copyState();
+    const auto preset = getCurrentPreset();
+    tree.setProperty (presetNameProperty, preset.name, nullptr);
+    tree.setProperty (presetIsUserProperty, preset.isUser, nullptr);
+    tree.removeProperty (legacyPresetIndexProperty, nullptr);
+
+    if (auto xml = tree.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
@@ -172,8 +300,24 @@ void OrionAudioProcessor::setStateInformation (const void* data, int sizeInBytes
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (state.state.getType()))
         {
-            state.replaceState (juce::ValueTree::fromXml (*xml));
-            currentPreset = (int) state.state.getProperty ("preset", 0);
+            const auto tree = juce::ValueTree::fromXml (*xml);
+            state.replaceState (tree);
+
+            PresetRef ref;
+            if (tree.hasProperty (presetNameProperty))
+            {
+                ref.name = tree[presetNameProperty].toString();
+                ref.isUser = (bool) tree[presetIsUserProperty];
+            }
+            else
+            {
+                const auto& factory = orion::getFactoryPresets();
+                const int index = juce::jlimit (0, (int) factory.size() - 1, (int) tree.getProperty (legacyPresetIndexProperty, 0));
+                ref.name = factory[(size_t) index].name;
+            }
+
+            setCurrentPreset (std::move (ref));
+            presetBaselineStale = true;   // may be off the message thread; rebuilt on next use
         }
 }
 

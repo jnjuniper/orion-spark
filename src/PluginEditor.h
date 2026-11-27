@@ -161,12 +161,36 @@ private:
     };
 
     void timerCallback() override;
+    void refreshUserPresets();
+    int getCurrentIndex() const;          // position in factory + user presets, or -1
+    void loadIndex (int index);
     void step (int delta);
+    void showMenu();
     juce::Rectangle<float> getWindowArea() const;
+
+    void saveCurrent();
+    void saveAs (const juce::String& name);
+    void renameCurrent (const juce::String& newName);
+    void deleteCurrent();
+
+    // Confirmations open inside the plugin window (a separate window can end up behind
+    // the host's); the name dialog is its own always-on-top window so it can take
+    // typing. All are owned here, so closing the editor also closes them.
+    void askForName (const juce::String& title, const juce::String& initialName, const juce::String& confirmText,
+                     std::function<void (const juce::String&)> onConfirm);
+    void confirm (const juce::String& title, const juce::String& message, const juce::String& confirmText,
+                  std::function<void()> onConfirm);
+    void showMessage (const juce::String& title, const juce::String& message);
+    juce::Component& getDialogParent();
 
     OrionAudioProcessor& processor;
     StepButton previous { false }, next { true };
-    int shownPreset = -1;
+    std::vector<juce::String> userPresets;   // cached; refreshed when the library changes
+    juce::uint32 shownChangeCount = 0;
+    bool shownModified = false;
+
+    std::unique_ptr<juce::AlertWindow> nameDialog;
+    juce::ScopedMessageBox messageBox;
 };
 
 class OrionLookAndFeel final : public juce::LookAndFeel_V4
