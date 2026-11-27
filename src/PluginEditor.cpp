@@ -22,6 +22,7 @@ namespace
         const Colour gold   { 0xffd9b36c };
         const Colour amber  { 0xffffa53a };
         const Colour ledRed { 0xffff4a26 };
+        const Colour inTune { 0xff8cff7a };
     }
 
     juce::Font font (const char* family, const char* style, float height, float tracking = 0.0f)
@@ -97,6 +98,42 @@ namespace
         g.drawText (text, area.translated (0.0f, 1.0f), j);
         g.setColour (ink);
         g.drawText (text, area, j);
+    }
+
+    // Recessed smoked-glass window used by the header displays. Returns the glass area.
+    juce::Rectangle<float> drawGlassWindow (juce::Graphics& g, juce::Rectangle<float> w)
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.fillRoundedRectangle (w.translated (0.0f, 1.0f), 6.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.9f));
+        g.fillRoundedRectangle (w.translated (0.0f, -0.6f), 6.0f);
+
+        const auto glass = w.reduced (1.5f);
+        g.setGradientFill (juce::ColourGradient (Colour (0xff100c08), glass.getX(), glass.getY(), Colour (0xff050403), glass.getX(), glass.getBottom(), false));
+        g.fillRoundedRectangle (glass, 5.0f);
+        g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (0.7f), glass.getX(), glass.getY(),
+                                                 juce::Colours::transparentBlack, glass.getX(), glass.getY() + 8.0f, false));
+        g.fillRoundedRectangle (glass, 5.0f);
+        return glass;
+    }
+
+    void drawGlassSheen (juce::Graphics& g, juce::Rectangle<float> glass)
+    {
+        juce::Path sheen;
+        sheen.addRoundedRectangle (glass.withHeight (glass.getHeight() * 0.45f), 5.0f);
+        g.setGradientFill (juce::ColourGradient (juce::Colours::white.withAlpha (0.07f), glass.getX(), glass.getY(),
+                                                 juce::Colours::white.withAlpha (0.0f), glass.getX(), glass.getY() + glass.getHeight() * 0.45f, false));
+        g.fillPath (sheen);
+    }
+
+    // Backlit text with a soft glow.
+    void drawGlowText (juce::Graphics& g, const juce::String& s, juce::Rectangle<float> r, juce::Justification j, Colour c)
+    {
+        g.setColour (c.withAlpha (0.12f));
+        for (auto o : std::initializer_list<juce::Point<float>> { { -1.2f, 0.0f }, { 1.2f, 0.0f }, { 0.0f, -1.2f }, { 0.0f, 1.2f } })
+            g.drawText (s, r.translated (o.x, o.y), j);
+        g.setColour (c);
+        g.drawText (s, r, j);
     }
 
 }
@@ -520,6 +557,214 @@ void PedalPanel::paint (juce::Graphics& g)
 }
 
 // ---------------------------------------------------------------------------
+TunerButton::TunerButton() : juce::Button ("tuner")
+{
+    setClickingTogglesState (true);
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    setTooltip ("Tuner (mutes the output)");
+}
+
+void TunerButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
+{
+    const auto c = getLocalBounds().toFloat().getCentre();
+    const auto bezel = juce::Rectangle<float> (24.0f, 24.0f).withCentre (c);
+    const bool on = getToggleState();
+
+    if (on)
+    {
+        g.setGradientFill (juce::ColourGradient (colours::amber.withAlpha (0.4f), c.x, c.y,
+                                                 colours::amber.withAlpha (0.0f), c.x + 19.0f, c.y, true));
+        g.fillEllipse (bezel.expanded (7.0f));
+    }
+
+    // Chrome bezel.
+    g.setColour (juce::Colours::black.withAlpha (0.55f));
+    g.fillEllipse (bezel.translated (0.8f, 1.6f));
+    g.setGradientFill (chromeGradient (bezel));
+    g.fillEllipse (bezel);
+    g.setColour (juce::Colours::black.withAlpha (0.6f));
+    g.drawEllipse (bezel, 0.6f);
+
+    // Cap: dark when off, lit amber when on.
+    const auto cap = bezel.reduced (4.0f).translated (0.0f, down ? 0.6f : 0.0f);
+    g.setColour (juce::Colours::black.withAlpha (0.7f));
+    g.fillEllipse (cap.expanded (0.8f));
+    g.setGradientFill (on ? juce::ColourGradient (Colour (0xffffd08a), cap.getX(), cap.getY(), Colour (0xffd8661a), cap.getX(), cap.getBottom(), false)
+                          : juce::ColourGradient (Colour (0xff3a3330), cap.getX(), cap.getY(), Colour (0xff121010), cap.getX(), cap.getBottom(), false));
+    g.fillEllipse (cap);
+
+    g.setColour (juce::Colours::white.withAlpha (on ? 0.35f : 0.12f));
+    g.fillEllipse (cap.withHeight (cap.getHeight() * 0.45f).reduced (cap.getWidth() * 0.2f, 0.6f));
+
+    if (highlighted)
+    {
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.fillEllipse (cap);
+    }
+}
+
+// ---------------------------------------------------------------------------
+TunerDisplay::TunerDisplay (const OrionAudioProcessor& p) : processor (p)
+{
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);   // click to close
+}
+
+void TunerDisplay::visibilityChanged()
+{
+    if (isVisible())
+    {
+        shown = {};
+        candidateNote = -1;
+        startTimerHz (30);
+    }
+    else
+    {
+        stopTimer();
+    }
+}
+
+void TunerDisplay::mouseUp (const juce::MouseEvent&)
+{
+    if (onDismiss)
+        onDismiss();
+}
+
+void TunerDisplay::timerCallback()
+{
+    const auto& tap = processor.getInputTap();
+    if (const double rate = tap.getSampleRate(); ! juce::exactlyEqual (rate, preparedRate))
+    {
+        detector.prepare (rate);
+        input.resize ((size_t) detector.getRequiredInputSamples());
+        preparedRate = rate;
+    }
+
+    PitchReading reading;
+    if (tap.copyLatest (input.data(), (int) input.size()))
+        reading = detector.analyse (input.data());
+
+    const auto previous = shown;
+    const double now = juce::Time::getMillisecondCounterHiRes();
+
+    if (reading.hasPitch())
+    {
+        const auto note = toNote (reading.frequency);
+        lastPitchTime = now;
+
+        if (note.midiNote == shown.midiNote)
+        {
+            shown.cents += 0.35f * (note.cents - shown.cents);
+            candidateNote = -1;
+        }
+        else if (note.midiNote != candidateNote)
+        {
+            candidateNote = note.midiNote;
+            candidateFrames = 1;
+        }
+        else if (++candidateFrames >= 2)
+        {
+            shown = note;
+            candidateNote = -1;
+        }
+    }
+    else if (now - lastPitchTime > 600.0)
+    {
+        shown = {};
+        candidateNote = -1;
+    }
+
+    if (shown.midiNote != previous.midiNote || std::abs (shown.cents - previous.cents) > 0.05f)
+        repaint();
+}
+
+void TunerDisplay::paint (juce::Graphics& g)
+{
+    const auto glass = drawGlassWindow (g, getLocalBounds().toFloat().reduced (36.0f, 2.0f));
+
+    const bool hasNote = shown.midiNote >= 0;
+    const bool inTune = hasNote && std::abs (shown.cents) <= inTuneCents;
+    const auto ink = inTune ? colours::inTune : colours::amber;
+
+    auto area = glass.reduced (14.0f, 0.0f);
+    auto noteArea = area.removeFromLeft (56.0f);
+    const auto readoutArea = area.removeFromRight (62.0f);
+    const auto scale = area.reduced (8.0f, 0.0f);
+
+    // Note name with a small octave number.
+    if (hasNote)
+    {
+        const auto nameFont = sans ("Demi Bold", 24.0f);
+        const auto name = shown.getName();
+        g.setFont (nameFont);
+        const float nameWidth = juce::GlyphArrangement::getStringWidth (nameFont, name);
+        drawGlowText (g, name, noteArea, juce::Justification::centredLeft, ink);
+        g.setFont (sans ("Demi Bold", 10.0f));
+        drawGlowText (g, juce::String (shown.getOctave()), noteArea.withTrimmedLeft (nameWidth + 1.5f).withTrimmedTop (14.0f),
+                      juce::Justification::centredLeft, ink.withAlpha (0.7f));
+    }
+    else
+    {
+        g.setFont (sans ("Demi Bold", 24.0f));
+        drawGlowText (g, juce::String (juce::CharPointer_UTF8 ("\xe2\x80\x93")), noteArea, juce::Justification::centredLeft,
+                      colours::amber.withAlpha (0.3f));
+    }
+
+    // LED row, 5 cents per segment; the taller centre one lights green only when in tune.
+    constexpr int segments = 21, centre = segments / 2;
+    int lit = -1;
+    if (inTune)
+        lit = centre;
+    else if (hasNote)
+        lit = centre + (shown.cents > 0.0f ? 1 : -1) * juce::jlimit (1, centre, juce::roundToInt (std::abs (shown.cents) / 5.0f));
+    const float step = scale.getWidth() / (float) segments;
+    const float rowY = glass.getCentreY() - 3.0f;
+
+    for (int i = 0; i < segments; ++i)
+    {
+        const bool isCentre = i == centre;
+        const auto colour = isCentre ? colours::inTune : colours::amber;
+        const auto led = juce::Rectangle<float> (step * 0.5f, isCentre ? 18.0f : 12.0f).withCentre ({ scale.getX() + step * ((float) i + 0.5f), rowY });
+
+        if (i == lit)
+        {
+            g.setColour (colour.withAlpha (0.25f));
+            g.fillRoundedRectangle (led.expanded (2.5f), 3.0f);
+            g.setColour (colour);
+        }
+        else
+        {
+            g.setColour (colour.withAlpha (isCentre ? 0.16f : 0.1f));
+        }
+        g.fillRoundedRectangle (led, 1.5f);
+    }
+
+    g.setFont (sans ("Demi Bold", 7.0f, 0.15f));
+    for (auto [text, x, j] : { std::tuple { "-50", scale.getX(), juce::Justification::centredLeft },
+                                std::tuple { "0", scale.getCentreX() - 20.0f, juce::Justification::centred },
+                                std::tuple { "+50", scale.getRight() - 40.0f, juce::Justification::centredRight } })
+        drawGlowText (g, text, { x, glass.getBottom() - 12.0f, 40.0f, 9.0f }, j, colours::amber.withAlpha (0.4f));
+
+    // Cents, or what the tuner is set to while waiting for a note.
+    if (hasNote)
+    {
+        const int cents = juce::roundToInt (shown.cents);
+        g.setFont (sans ("Demi Bold", 15.0f));
+        drawGlowText (g, (cents > 0 ? "+" : "") + juce::String (cents), readoutArea.withTrimmedBottom (10.0f),
+                      juce::Justification::centredRight, ink);
+        g.setFont (sans ("Demi Bold", 7.0f, 0.22f));
+        drawGlowText (g, "CENTS", readoutArea.withTrimmedTop (20.0f), juce::Justification::centredRight, colours::amber.withAlpha (0.55f));
+    }
+    else
+    {
+        g.setFont (sans ("Demi Bold", 8.0f, 0.22f));
+        drawGlowText (g, "TUNER", readoutArea.withTrimmedBottom (10.0f), juce::Justification::centredRight, colours::amber.withAlpha (0.6f));
+        drawGlowText (g, "A4 = 440 HZ", readoutArea.withTrimmedTop (16.0f), juce::Justification::centredRight, colours::amber.withAlpha (0.4f));
+    }
+
+    drawGlassSheen (g, glass);
+}
+
+// ---------------------------------------------------------------------------
 PresetDisplay::StepButton::StepButton (bool isNext) : juce::Button (isNext ? "next" : "previous"), next (isNext)
 {
     setMouseCursor (juce::MouseCursor::PointingHandCursor);
@@ -666,7 +911,8 @@ void PresetDisplay::paint (juce::Graphics& g)
 
 // ---------------------------------------------------------------------------
 EditorRoot::EditorRoot (OrionAudioProcessor& p)
-    : presetDisplay (p),
+    : processor (p),
+      presetDisplay (p),
       inputAttachment (p.getState(), OrionAudioProcessor::inputGainId, inputKnob),
       outputAttachment (p.getState(), OrionAudioProcessor::outputGainId, outputKnob)
 {
@@ -676,6 +922,17 @@ EditorRoot::EditorRoot (OrionAudioProcessor& p)
 
     for (auto* knob : { &inputKnob, &outputKnob })
         knob->setDoubleClickReturnValue (true, 0.0);
+
+    addAndMakeVisible (tunerButton);
+    addChildComponent (tunerDisplay);
+    tunerButton.onClick = [this] { setTunerShown (tunerButton.getToggleState()); };
+    tunerDisplay.onDismiss = [this]
+    {
+        tunerButton.setToggleState (false, juce::dontSendNotification);
+        setTunerShown (false);
+    };
+    tunerButton.setToggleState (processor.isTunerActive(), juce::dontSendNotification);
+    setTunerShown (processor.isTunerActive());
 
     for (const auto& pedal : p.getPedals())
         addAndMakeVisible (*panels.emplace_back (std::make_unique<PedalPanel> (p.getState(), *pedal)));
@@ -688,6 +945,8 @@ void EditorRoot::resized()
     presetDisplay.setBounds (juce::Rectangle<int> (480, 46).withCentre ({ designWidth / 2, headerHeight / 2 }));
     inputKnob.setBounds (juce::Rectangle<int> (56, 56).withCentre ({ designWidth - 150, 32 }));
     outputKnob.setBounds (juce::Rectangle<int> (56, 56).withCentre ({ designWidth - 72, 32 }));
+    tunerButton.setBounds (juce::Rectangle<int> (44, 44).withCentre ({ designWidth - 228, 32 }));
+    tunerDisplay.setBounds (presetDisplay.getBounds());
 
     const int count = (int) panels.size();
     const int left = (designWidth - count * slotWidth) / 2;
@@ -698,6 +957,13 @@ void EditorRoot::resized()
 
     header.invalidate();
     boardArt.invalidate();
+}
+
+void EditorRoot::setTunerShown (bool on)
+{
+    processor.setTunerActive (on);
+    presetDisplay.setVisible (! on);
+    tunerDisplay.setVisible (on);
 }
 
 void EditorRoot::renderHeader (juce::Graphics& g, juce::Rectangle<float> area, float scale) const
@@ -718,7 +984,8 @@ void EditorRoot::renderHeader (juce::Graphics& g, juce::Rectangle<float> area, f
                  { 99.0f, 44.0f, 300.0f, 10.0f }, juce::Justification::centredLeft, colours::cream.withAlpha (0.45f));
 
     g.setFont (sans ("Demi Bold", 7.0f, 0.3f));
-    for (auto [label, x] : { std::pair { "INPUT", (float) designWidth - 150.0f }, std::pair { "OUTPUT", (float) designWidth - 72.0f } })
+    for (auto [label, x] : { std::pair { "TUNER", (float) designWidth - 228.0f }, std::pair { "INPUT", (float) designWidth - 150.0f },
+                             std::pair { "OUTPUT", (float) designWidth - 72.0f } })
         drawPrinted (g, label, juce::Rectangle<float> (70.0f, 10.0f).withCentre ({ x, 63.0f }), juce::Justification::centred, colours::cream.withAlpha (0.6f));
 }
 
@@ -958,6 +1225,11 @@ OrionAudioProcessorEditor::OrionAudioProcessorEditor (OrionAudioProcessor& p)
 
 OrionAudioProcessorEditor::~OrionAudioProcessorEditor()
 {
+    // With the window gone there'd be no way to see or switch off the tuner, and the
+    // plugin would stay silent.
+    if (auto* p = dynamic_cast<OrionAudioProcessor*> (getAudioProcessor()))
+        p->setTunerActive (false);
+
     setLookAndFeel (nullptr);
 }
 

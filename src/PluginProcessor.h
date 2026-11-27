@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "Pedal.h"
+#include "Tuner.h"
 #include <memory>
 #include <vector>
 
@@ -47,6 +48,12 @@ public:
     juce::AudioProcessorValueTreeState& getState() noexcept { return state; }
     const std::vector<std::unique_ptr<orion::Pedal>>& getPedals() const noexcept { return pedals; }
 
+    // ---- Tuner. Deliberately not a parameter and never saved, so a session can't
+    // open muted. The editor switches it off when it closes.
+    void setTunerActive (bool shouldBeActive) noexcept { tunerActive = shouldBeActive; }   // mutes the output
+    bool isTunerActive() const noexcept { return tunerActive.load(); }
+    const orion::InputTap& getInputTap() const noexcept { return inputTap; }           // raw input, before any pedal
+
     static constexpr const char* inputGainId = "in_gain";
     static constexpr const char* outputGainId = "out_gain";
 
@@ -61,6 +68,12 @@ private:
 
     std::atomic<float>* inputGainParam = nullptr;
     std::atomic<float>* outputGainParam = nullptr;
+
+    orion::InputTap inputTap;
+    std::atomic<bool> tunerActive { false };
+    // Ramp to silence and back: one before the pedals, so what's played while tuning doesn't
+    // ring out of the echo and reverb afterwards, and one at the output for their tails.
+    juce::SmoothedValue<float> tunerInputGain { 1.0f }, tunerOutputGain { 1.0f };
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Multiplicative> inputGain { 1.0f }, outputGain { 1.0f };
     int maxBlockSize = 512;
     std::atomic<int> currentPreset { 0 };
