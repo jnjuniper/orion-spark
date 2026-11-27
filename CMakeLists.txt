@@ -20,6 +20,7 @@ set(ORION_CORE_SOURCES
     src/PluginEditor.cpp
     src/Pedal.cpp
     src/Presets.cpp
+    src/Tuner.cpp
     src/ui/Render.cpp
     src/ui/Logo.cpp
     src/pedals/NoiseGate.cpp

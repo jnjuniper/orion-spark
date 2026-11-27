@@ -55,6 +55,12 @@ Chain: **Gate → Overdrive → Brit Stack → 4-Track Pre → Mod → Tape Echo
 Each pedal has a footswitch. Echo and Spring keep ringing out when switched off (trails).
 Double-click a knob to reset it. The window can be resized from its corner.
 
+**Tuner:** the round **TUNER** button in the header mutes the output and turns the preset display into a
+chromatic tuner (A4 = 440 Hz, down to drop A). It listens to the dry input before any pedal, so it reads the
+string even with drives on. The LEDs are 5 cents apart; the centre one lights green within ±2 cents. Click the
+display or the button again to switch it off. The tuner is never saved with a session and switches off when
+the plugin window closes, so the plugin can't be left silent by accident.
+
 **Presets:** click the display in the header (or use the arrows). Factory presets are tones "inspired by"
 John Sykes, Mk.gee, 70s rock and metal rhythm players. The selected preset and any tweaks are saved with
 your Ableton set. A `*` after the name means the knobs differ from the saved preset.

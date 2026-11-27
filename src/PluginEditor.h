@@ -102,6 +102,44 @@ private:
     CachedArt face { *this }, ledLit { *this }, ledDark { *this };
 };
 
+// Round push button in the header that switches the tuner on and off.
+class TunerButton final : public juce::Button
+{
+public:
+    TunerButton();
+    void paintButton (juce::Graphics&, bool highlighted, bool down) override;
+};
+
+// Takes the preset display's place while the tuner is on: the note, a row of LEDs
+// from 50 cents flat to 50 cents sharp, and the offset in cents. Click it to close.
+class TunerDisplay final : public juce::Component, private juce::Timer
+{
+public:
+    explicit TunerDisplay (const OrionAudioProcessor&);
+    void paint (juce::Graphics&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+    void visibilityChanged() override;
+
+    std::function<void()> onDismiss;
+
+    static constexpr float inTuneCents = 2.0f;
+
+private:
+    void timerCallback() override;
+
+    const OrionAudioProcessor& processor;
+    PitchDetector detector;
+    double preparedRate = 0.0;
+    std::vector<float> input;
+
+    // What's on the glass. A new note must be heard twice in a row before it replaces
+    // the shown one, so the display doesn't flicker between neighbours; the last note
+    // stays up briefly after the string goes quiet.
+    NoteReading shown;
+    int candidateNote = -1, candidateFrames = 0;
+    double lastPitchTime = 0.0;
+};
+
 // Preset selector styled as a backlit display, with prev/next buttons.
 class PresetDisplay final : public juce::Component, private juce::Timer
 {
@@ -180,11 +218,15 @@ private:
     void renderHeader (juce::Graphics&, juce::Rectangle<float> area, float scale) const;
     void renderBoard (juce::Graphics&, juce::Rectangle<float> area, float scale) const;
     void renderNameplate (juce::Graphics&, juce::Rectangle<float> plate) const;
+    void setTunerShown (bool);
 
+    OrionAudioProcessor& processor;
     PresetDisplay presetDisplay;
     RealKnob inputKnob { 40.0f }, outputKnob { 40.0f };
     juce::AudioProcessorValueTreeState::SliderAttachment inputAttachment, outputAttachment;
     std::vector<std::unique_ptr<PedalPanel>> panels;
+    TunerButton tunerButton;
+    TunerDisplay tunerDisplay { processor };
 
     CachedArt header { *this }, boardArt { *this };
 };

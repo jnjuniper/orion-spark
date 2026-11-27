@@ -5,6 +5,8 @@
 
 #include "PluginProcessor.h"
 #include "Presets.h"
+#include "PluginEditor.h"
+#include "Tuner.h"
 #include "ui/Logo.h"
 #include <cmath>
 #include <functional>
@@ -649,6 +651,259 @@ void testCpu()
 
 // Renders the editor to PNGs (default state, and with the echo bypassed) so the
 // layout can be checked without a host. Also reports which fonts resolved.
+namespace
+{
+
+// -----------------------------------------------------------------------------
+// Guitar-like tone: weak fundamental, strong 2nd and 3rd harmonics, a little noise.
+Signal guitarTone (double sr, double frequency, float amp)
+{
+    auto rng = std::make_shared<juce::Random> (7);
+    return [=] (int i)
+    {
+        static constexpr float harmonics[] = { 0.15f, 1.0f, 0.6f, 0.5f, 0.3f, 0.25f, 0.15f, 0.1f };
+        const double t = i / sr;
+        double s = 0.0;
+        for (int k = 0; k < 8; ++k)
+            s += harmonics[k] * std::sin (2.0 * juce::MathConstants<double>::pi * frequency * (k + 1) * t + 0.7 * k);
+        return amp * 0.3f * (float) s + 0.0005f * (rng->nextFloat() * 2.0f - 1.0f);
+    };
+}
+
+orion::PitchReading detect (orion::PitchDetector& detector, const Signal& signal, int offset = 12345)
+{
+    std::vector<float> samples ((size_t) detector.getRequiredInputSamples());
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = signal (offset + (int) i);
+    return detector.analyse (samples.data());
+}
+
+float centsBetween (float detected, double expected) { return (float) (1200.0 * std::log2 (detected / expected)); }
+
+void testTunerNotes()
+{
+    std::cout << "\nTuner: note names (A4 = 440 Hz)\n";
+    const auto a4 = orion::toNote (440.0f), lowE = orion::toNote (82.407f), dropA = orion::toNote (55.0f);
+    const auto sharpA = orion::toNote (440.0f * std::pow (2.0f, 17.0f / 1200.0f));
+    const auto flatB = orion::toNote (246.94f * std::pow (2.0f, -30.0f / 1200.0f));
+    check (a4.getName() == "A" && a4.getOctave() == 4 && std::abs (a4.cents) < 0.01f, "440 Hz is A4, 0 cents");
+    check (lowE.getName() == "E" && lowE.getOctave() == 2 && std::abs (lowE.cents) < 0.1f, "82.41 Hz is E2 (low E string)");
+    check (dropA.getName() == "A" && dropA.getOctave() == 1, "55 Hz is A1 (drop A)");
+    check (sharpA.getName() == "A" && std::abs (sharpA.cents - 17.0f) < 0.01f, "A + 17 cents reads +17");
+    check (flatB.getName() == "B" && std::abs (flatB.cents + 30.0f) < 0.05f, "B - 30 cents reads -30");
+}
+
+void testTunerAccuracy()
+{
+    std::cout << "\nTuner: pitch detection on guitar-like tones with a weak fundamental\n";
+    const double notes[] = { 55.0, 61.735, 73.416, 82.407, 110.0, 146.83, 196.0, 246.94, 329.63,   // drop A .. high E
+                             440.0, 659.26, 987.77, 1318.5 };                                     // up the neck
+
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+    {
+        orion::PitchDetector detector;
+        detector.prepare (sr);
+        float worstLow = 0.0f, worstHigh = 0.0f;
+        int missed = 0, wrongNote = 0;
+
+        for (double note : notes)
+            for (double detune : { -23.0, 0.0, 9.0 })
+            {
+                const double f = note * std::pow (2.0, detune / 1200.0);
+                const auto reading = detect (detector, guitarTone (sr, f, 0.5f));
+                if (! reading.hasPitch())
+                {
+                    ++missed;
+                    continue;
+                }
+
+                const float err = std::abs (centsBetween (reading.frequency, f));
+                if (orion::toNote (reading.frequency).midiNote != orion::toNote ((float) note).midiNote)
+                    ++wrongNote;
+                (note < 700.0 ? worstLow : worstHigh) = juce::jmax (note < 700.0 ? worstLow : worstHigh, err);
+            }
+
+        check (missed == 0 && wrongNote == 0, juce::String (sr, 0) + " Hz: every note found, no octave errors ("
+                                                   + juce::String (missed) + " missed, " + juce::String (wrongNote) + " wrong)");
+        check (worstLow < 1.0f && worstHigh < 1.0f, juce::String (sr, 0) + " Hz: within 1 cent (worst " + juce::String (worstLow, 2)
+                                                         + " up to 700 Hz, " + juce::String (worstHigh, 2) + " above)");
+    }
+
+    orion::PitchDetector detector;
+    detector.prepare (48000.0);
+
+    // A plucked string fading quickly during the analysis window.
+    float worstPluck = 0.0f;
+    for (double f : { 82.407, 110.0, 329.63 })
+    {
+        const auto tone = guitarTone (48000.0, f, 0.5f);
+        const auto reading = detect (detector, [=] (int i) { return tone (i) * (float) std::exp (-4.0 * i / 48000.0); }, 2400);
+        worstPluck = juce::jmax (worstPluck, reading.hasPitch() ? std::abs (centsBetween (reading.frequency, f)) : 100.0f);
+    }
+    check (worstPluck < 1.0f, "decaying pluck: within 1 cent (worst " + juce::String (worstPluck, 2) + ")");
+
+    // Real strings are stiff: overtones run slightly sharp (k * f * sqrt (1 + B k^2)), which
+    // pulls any period-based reading (and the ear) a little above the fundamental. The
+    // reading must stay on the right note and move smoothly with stiffness, without jumps.
+    for (double b : { 1.0e-4, 5.0e-4 })
+    {
+        int wrong = 0;
+        float lowest = 1000.0f, highest = -1000.0f;
+        for (double f : { 82.407, 110.0, 196.0, 329.63, 659.26, 1318.5 })
+        {
+            const auto reading = detect (detector, [=] (int i)
+            {
+                static constexpr float harmonics[] = { 0.6f, 1.0f, 0.6f, 0.5f, 0.3f, 0.25f };
+                const double t = i / 48000.0;
+                double s = 0.0;
+                for (int k = 1; k <= 6; ++k)
+                    s += harmonics[k - 1] * std::sin (2.0 * juce::MathConstants<double>::pi * k * f * std::sqrt (1.0 + b * k * k) * t);
+                return 0.15f * (float) s;
+            });
+
+            if (! reading.hasPitch() || orion::toNote (reading.frequency).midiNote != orion::toNote ((float) f).midiNote)
+            {
+                ++wrong;
+                continue;
+            }
+            const float cents = centsBetween (reading.frequency, f * std::sqrt (1.0 + b));
+            lowest = juce::jmin (lowest, cents);
+            highest = juce::jmax (highest, cents);
+        }
+
+        const float limit = b < 2.0e-4 ? 2.0f : 8.0f;
+        check (wrong == 0 && lowest > -1.0f && highest < limit && highest - lowest < 4.0f,
+               "stiff string (B = " + juce::String (b, 4) + "): right note, " + juce::String (lowest, 1) + " to +"
+                   + juce::String (highest, 1) + " cents from the fundamental");
+    }
+
+    check (! detect (detector, [] (int) { return 0.0f; }).hasPitch(), "silence: no note");
+    check (! detect (detector, noiseBurst (48000.0, 10.0, 0.0001f), 0).hasPitch(), "-80 dBFS noise: no note");
+    check (! detect (detector, noiseBurst (48000.0, 10.0, 0.3f), 0).hasPitch(), "loud white noise: no note");
+
+    // Analysis cost at the highest rate (it runs 30 times a second on the UI thread).
+    detector.prepare (96000.0);
+    const auto tone = guitarTone (96000.0, 82.407, 0.5f);
+    std::vector<float> samples ((size_t) detector.getRequiredInputSamples());
+    for (size_t i = 0; i < samples.size(); ++i)
+        samples[i] = tone ((int) i);
+    const auto t0 = juce::Time::getMillisecondCounterHiRes();
+    for (int i = 0; i < 30; ++i)
+        detector.analyse (samples.data());
+    const double ms = (juce::Time::getMillisecondCounterHiRes() - t0) / 30.0;
+    check (ms < 5.0, "one analysis takes " + juce::String (ms, 2) + " ms at 96 kHz");
+}
+
+void testTunerInProcessor()
+{
+    std::cout << "\nTuner in the plugin: mutes, listens to the dry input, never saved\n";
+    const double sr = 48000.0;
+    const auto lowE = guitarTone (sr, 82.407, 0.5f);
+
+    {
+        OrionAudioProcessor p;
+        const auto open = run (p, sr, 256, 1.0, lowE);
+        p.setTunerActive (true);
+        const auto muted = run (p, sr, 256, 1.0, lowE);
+        check (open.rms (sr, 0.2, 1.0) > 0.01f && muted.finite && muted.peak < 1.0e-6f,
+               "tuner on: output silent (peak " + juce::String (toDb (muted.peak), 1) + " dBFS)");
+
+        // The tap carries the dry input, so the tuner reads the string even with drives on.
+        orion::PitchDetector detector;
+        detector.prepare (sr);
+        std::vector<float> samples ((size_t) detector.getRequiredInputSamples());
+        const bool copied = p.getInputTap().copyLatest (samples.data(), (int) samples.size());
+        const auto reading = detector.analyse (samples.data());
+        const auto note = orion::toNote (reading.frequency);
+        check (copied && note.getName() == "E" && note.getOctave() == 2 && std::abs (note.cents) < 1.0f,
+               "reads the input through the plugin: " + note.getName() + juce::String (note.getOctave()) + " "
+                   + juce::String (note.cents, 2) + " cents");
+    }
+
+    {
+        // Switching on mid-stream fades out rather than cutting.
+        OrionAudioProcessor p;
+        setAllPedals (p, false);
+        int block = 0;
+        const auto r = run (p, sr, 64, 0.5, [=] (int i) { return 0.5f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / sr); },
+                            [&block] (OrionAudioProcessor& proc, juce::Random&) { if (++block == 200) proc.setTunerActive (true); });
+        const auto at = (size_t) (199 * 64);
+        float worstStep = 0.0f;
+        for (size_t i = at; i < at + (size_t) (0.03 * sr); ++i)
+            worstStep = juce::jmax (worstStep, std::abs (r.left[i] - r.left[i - 1]));
+        check (worstStep < 0.05f && r.rms (sr, 0.4, 0.5) < 1.0e-6f, "fades out without a click (largest step " + juce::String (worstStep, 3) + ")");
+    }
+
+    {
+        // Plucks played while tuning must not ring out of the echo and reverb afterwards.
+        OrionAudioProcessor p;
+        setAllPedals (p, false);
+        setParam (p, "echo_on", 1.0f);
+        setParam (p, "spring_on", 1.0f);
+        setParam (p, "echo_repeats", 0.8f);
+        p.setTunerActive (true);
+        int block = 0;
+        const int offBlock = (int) (1.0 * sr / 256);
+        const auto r = run (p, sr, 256, 3.0, [&] (int i) { return i < (int) (0.9 * sr) ? lowE (i) : 0.0f; },
+                            [&] (OrionAudioProcessor& proc, juce::Random&) { if (block++ == offBlock) proc.setTunerActive (false); });
+        check (r.peak < 1.0e-6f, "tuning plucks don't ring out of echo / reverb when switched off (peak "
+                                     + juce::String (toDb (r.peak), 1) + " dBFS)");
+    }
+
+    {
+        OrionAudioProcessor a;
+        a.setTunerActive (true);
+        juce::MemoryBlock data;
+        a.getStateInformation (data);
+        OrionAudioProcessor b;
+        b.setStateInformation (data.getData(), (int) data.getSize());
+        const auto xml = juce::AudioProcessor::getXmlFromBinary (data.getData(), (int) data.getSize());
+        check (! b.isTunerActive() && xml != nullptr && ! xml->toString().containsIgnoreCase ("tuner"),
+               "not saved in the session; a restored session isn't muted");
+    }
+
+    {
+        OrionAudioProcessor p;
+        auto editor = std::unique_ptr<juce::AudioProcessorEditor> (p.createEditor());
+        p.setTunerActive (true);
+        editor.reset();
+        check (! p.isTunerActive(), "closing the editor switches the tuner off");
+    }
+
+    {
+        // The header button and clicking the tuner display.
+        OrionAudioProcessor p;
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
+        juce::Button* button = nullptr;
+        orion::TunerDisplay* display = nullptr;
+        std::function<void (juce::Component&)> find = [&] (juce::Component& c)
+        {
+            if (auto* b = dynamic_cast<juce::Button*> (&c); b != nullptr && b->getName() == "tuner")
+                button = b;
+            if (auto* d = dynamic_cast<orion::TunerDisplay*> (&c))
+                display = d;
+            for (auto* child : c.getChildren())
+                find (*child);
+        };
+        find (*editor);
+
+        const bool found = button != nullptr && display != nullptr;
+        bool onWorks = false, dismissWorks = false;
+        if (found)
+        {
+            button->triggerClick();
+            juce::MessageManager::getInstance()->runDispatchLoopUntil (50);
+            onWorks = p.isTunerActive() && display->isVisible() && button->getToggleState();
+
+            display->onDismiss();
+            dismissWorks = ! p.isTunerActive() && ! display->isVisible() && ! button->getToggleState();
+        }
+        check (found && onWorks && dismissWorks, "TUNER button switches it on; clicking the display switches it off");
+    }
+}
+
+} // namespace
+
 static bool writeSnapshot (OrionAudioProcessor& p, const juce::File& file)
 {
     std::unique_ptr<juce::AudioProcessorEditor> editor (p.createEditor());
@@ -724,6 +979,23 @@ static int snapshot (const juce::File& file)
     bool ok = writeSnapshot (p, file);
     setParam (p, "echo_on", 0.0f);
     ok = writeSnapshot (p, file.getSiblingFile (file.getFileNameWithoutExtension() + "-echo-off.png")) && ok;
+
+    // Tuner on, reading a low E string 4 cents sharp.
+    {
+        OrionAudioProcessor tp;
+        run (tp, 48000.0, 256, 0.5, guitarTone (48000.0, 82.407 * std::pow (2.0, 4.0 / 1200.0), 0.5f));
+        tp.setTunerActive (true);
+        std::unique_ptr<juce::AudioProcessorEditor> editor (tp.createEditor());
+        juce::MessageManager::getInstance()->runDispatchLoopUntil (500);   // let the display take a few readings
+        const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true, 2.0f);
+        const auto out = file.getSiblingFile (file.getFileNameWithoutExtension() + "-tuner.png");
+        out.deleteFile();
+        juce::FileOutputStream stream (out);
+        const bool tunerOk = stream.openedOk() && juce::PNGImageFormat().writeImageToStream (image, stream);
+        std::cout << (tunerOk ? "Wrote " : "Could not write ") << out.getFullPathName() << "\n";
+        ok = tunerOk && ok;
+    }
+
     return ok ? 0 : 1;
 }
 
@@ -748,6 +1020,9 @@ int main (int argc, char* argv[])
     testPresetStateRoundTrip();
     testUserPresets();
     testCpu();
+    testTunerNotes();
+    testTunerAccuracy();
+    testTunerInProcessor();
 
     std::cout << "\n" << (failures == 0 ? "ALL TESTS PASSED" : juce::String (failures) + " TEST(S) FAILED") << "\n";
     return failures == 0 ? 0 : 1;

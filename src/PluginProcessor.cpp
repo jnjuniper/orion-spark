@@ -77,6 +77,13 @@ void OrionAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
     }
     setLatencySamples (latency);
 
+    inputTap.setSampleRate (sampleRate);
+    for (auto* gain : { &tunerInputGain, &tunerOutputGain })
+    {
+        gain->reset (sampleRate, 0.02);
+        gain->setCurrentAndTargetValue (tunerActive.load() ? 0.0f : 1.0f);
+    }
+
     inputGain.reset (sampleRate, 0.03);
     outputGain.reset (sampleRate, 0.03);
     inputGain.setCurrentAndTargetValue (juce::Decibels::decibelsToGain (inputGainParam->load()));
@@ -99,6 +106,12 @@ void OrionAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     else if (numInputs == 0)
         buffer.clear();
 
+    // The tuner listens to the dry guitar, before the gate and drives.
+    inputTap.push (buffer.getReadPointer (0), numInputs >= 2 ? buffer.getReadPointer (1) : nullptr, numSamples);
+    const float tunerTarget = tunerActive.load() ? 0.0f : 1.0f;
+    tunerInputGain.setTargetValue (tunerTarget);
+    tunerOutputGain.setTargetValue (tunerTarget);
+
     inputGain.setTargetValue (juce::Decibels::decibelsToGain (inputGainParam->load()));
     outputGain.setTargetValue (juce::Decibels::decibelsToGain (outputGainParam->load()));
 
@@ -109,11 +122,13 @@ void OrionAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         juce::AudioBuffer<float> chunk (buffer.getArrayOfWritePointers(), 2, start, len);
 
         inputGain.applyGain (chunk, len);
+        tunerInputGain.applyGain (chunk, len);
 
         for (auto& pedal : pedals)
             pedal->process (chunk, len);
 
         outputGain.applyGain (chunk, len);
+        tunerOutputGain.applyGain (chunk, len);   // the pedals keep running, so latency is unchanged
     }
 
     // Last line of defence: never pass NaN/Inf to the host or your ears.
